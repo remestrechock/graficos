@@ -376,6 +376,7 @@ def load_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
 
     frames = []
     sheets_used = []
+    coverage_values = []
 
     for sheet in sheets_to_read:
         df_raw = pd.read_excel(xls, sheet_name=sheet)
@@ -383,6 +384,16 @@ def load_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
             continue
         df_raw.columns = [norm_text(c) for c in df_raw.columns]
         cols = list(df_raw.columns)
+        col_cobertura = match_column(cols, ["cobertura"])
+
+        if col_cobertura is not None:
+            valores_cobertura = (
+                df_raw[col_cobertura]
+                .map(parse_brl)
+                .dropna()
+            )
+            
+            coverage_values.extend(valores_cobertura.tolist())
 
         col_map = {}
         for target, aliases in COLUMN_ALIASES.items():
@@ -409,9 +420,25 @@ def load_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
         )
         tmp["Mês_num"] = df_raw[col_map["Mês"]].map(parse_month)
         tmp["Faturamento"] = df_raw[col_map["Faturamento"]].map(parse_brl)
+
+        # Preserva a cobertura na mesma linha dos dados comerciais
+        if col_cobertura is not None:
+            tmp["COBERTURA"] = (
+                df_raw[col_cobertura]
+                .map(parse_brl)
+                .pipe(pd.to_numeric, errors="coerce")
+                .round()
+                .astype("Int64")
+            )
+        else:
+            tmp["COBERTURA"] = pd.Series(
+                pd.NA, index=tmp.index, dtype="Int64"
+            )
+
         tmp["Origem"] = sheet
 
         frames.append(tmp)
+
         sheets_used.append(sheet)
 
     if not frames:
@@ -431,6 +458,7 @@ def load_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
 
     # Guarda metadado de quais abas foram usadas (para exibir na sidebar)
     df.attrs["sheets_used"] = sheets_used
+    df.attrs["coverage_data"] = coverage_values
     return df.reset_index(drop=True)
 
 
@@ -561,8 +589,13 @@ if best_row is not None:
 # TABS
 # ════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Visão Geral", "🏭 Fabricantes", "📦 Produtos", "⚖️ Comparativo", "📋 Dados"
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📈 Visão Geral",
+    "🏭 Fabricantes",
+    "📦 Produtos",
+    "⚖️ Comparativo",
+    "📋 Dados",
+    "🛡️ Cobertura"
 ])
 
 # ──────────────────────── TAB 1: VISÃO GERAL ────────────────────────
@@ -603,7 +636,7 @@ with tab1:
         st.plotly_chart(fig_pie_ano, use_container_width=True)
 
         st.markdown("<hr style='margin:6px 0;'>", unsafe_allow_html=True)
-        section_title("Top 5 Fabricantes", "🏅")
+        section_title("Top Fabricante", "🏅")
         top5 = fdf.groupby("Fabricante")["Faturamento"].sum().nlargest(5).reset_index()
         fig_top5 = px.bar(
             top5.sort_values("Faturamento"), x="Faturamento", y="Fabricante", orientation="h",
@@ -638,7 +671,7 @@ with tab2:
     fab_plot = fab_agg[fab_agg["Fabricante"].isin(top_fabs)]
 
     st.markdown('<div class="chart-card">', unsafe_allow_html=True)
-    section_title(f"Ranking de Fabricantes (Top {TOP_N})", "🏭")
+    section_title(f"Ranking de Fabricantes", "🏭")
     fig_fab = px.bar(
         fab_plot, x="Faturamento", y="Fabricante", color="Ano", barmode="group",
         orientation="h", color_discrete_map=COLOR_MAP,
@@ -797,6 +830,162 @@ with tab5:
         use_container_width=True,
     )
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+
+# ──────────────────────── TAB 6: COBERTURA ────────────────────────
+with tab6:
+    st.subheader("🛡️ Comparativo de Cobertura — 2025 × 2026")
+
+    cobertura_df = fdf.dropna(subset=["COBERTURA"]).copy()
+
+    if cobertura_df.empty:
+        st.warning("Não há dados de cobertura para os filtros selecionados.")
+
+    elif not {2025, 2026}.issubset(set(cobertura_df["Ano"].unique())):
+        st.info(
+            "Selecione 2025 e 2026 simultaneamente na barra lateral "
+            "para comparar a cobertura entre os anos."
+        )
+
+    else:
+        # Calcula a cobertura média por mês e ano
+        cobertura_mensal = (
+            cobertura_df[
+                cobertura_df["Ano"].isin([2025, 2026])
+            ]
+            .groupby(["Mês_num", "Mês", "Ano"], as_index=False)
+            ["COBERTURA"]
+            .max()
+        )
+
+        # Organiza os meses e mantém uma coluna para cada ano
+        cobertura_pivot = (
+            cobertura_mensal
+            .pivot_table(
+                index=["Mês_num", "Mês"],
+                columns="Ano",
+                values="COBERTURA",
+                aggfunc="mean",
+            )
+            .reset_index()
+            .sort_values("Mês_num")
+        )
+        # Garante que os valores de cobertura sejam inteiros
+        for ano in [2025, 2026]:
+            if ano in cobertura_pivot.columns:
+                cobertura_pivot[ano] = (
+                    pd.to_numeric(cobertura_pivot[ano], errors="coerce")
+                    .round()
+                    .astype("Int64")
+                )
+
+        # KPIs
+        c1, c2, c3 = st.columns(3)
+
+        media_2025 = cobertura_df.loc[
+            cobertura_df["Ano"] == 2025, "COBERTURA"
+        ].mean()
+
+        media_2026 = cobertura_df.loc[
+            cobertura_df["Ano"] == 2026, "COBERTURA"
+        ].mean()
+
+        diferenca = media_2026 - media_2025
+
+        c1.metric("Cobertura média — 2025", f"{media_2025:,.1f}")
+        c2.metric("Cobertura média — 2026", f"{media_2026:,.1f}")
+        c3.metric(
+            "Variação média",
+            f"{diferenca:+,.1f}",
+            delta=f"{diferenca / media_2025 * 100:+.1f}%"
+            if media_2025 else None,
+        )
+
+        # Gráfico de barras agrupadas, semelhante à aba Comparativo
+        fig_cobertura = go.Figure()
+
+        if 2025 in cobertura_pivot.columns:
+            fig_cobertura.add_bar(
+                x=cobertura_pivot["Mês"],
+                y=cobertura_pivot[2025],
+                name="2025",
+                marker_color=COLOR_2025,
+                text=cobertura_pivot[2025],
+                texttemplate="%{y:.0f}",
+                textposition="outside",
+            )
+
+        if 2026 in cobertura_pivot.columns:
+            fig_cobertura.add_bar(
+                x=cobertura_pivot["Mês"],
+                y=cobertura_pivot[2026],
+                name="2026",
+                marker_color=COLOR_2026,
+                text=cobertura_pivot[2026],
+                texttemplate="%{y:.0f}",
+                textposition="outside",
+            )
+
+
+            fig_cobertura.update_layout(
+                template=PLOTLY_TEMPLATE,
+                barmode="group",
+                title="Cobertura mensal — 2025 × 2026",
+                xaxis_title="Mês",
+                yaxis_title="Cobertura",
+                xaxis=dict(
+                    categoryorder="array",
+                    categoryarray=MONTH_NAMES,
+                ),
+                legend=dict(
+                    orientation="h",
+                    y=1.12,
+                    x=1,
+                    xanchor="right",
+                ),
+                height=430,
+            )
+
+
+        st.plotly_chart(fig_cobertura, use_container_width=True)
+
+        # Tabela comparativa
+        st.subheader("Tabela comparativa por mês")
+
+        colunas_tabela = ["Mês_num", "Mês"]
+
+        if 2025 in cobertura_pivot.columns:
+            colunas_tabela.append(2025)
+
+        if 2026 in cobertura_pivot.columns:
+            colunas_tabela.append(2026)
+
+        tabela_cobertura = cobertura_pivot[colunas_tabela].copy()
+
+        tabela_cobertura = tabela_cobertura.rename(
+            columns={
+                "Mês": "Mês",
+                2025: "Cobertura 2025",
+                2026: "Cobertura 2026",
+            }
+        )
+
+        tabela_cobertura = tabela_cobertura.drop(columns=["Mês_num"])
+
+        for coluna in ["Cobertura 2025", "Cobertura 2026"]:
+            if coluna in tabela_cobertura.columns:
+                tabela_cobertura[coluna] = (
+                    pd.to_numeric(tabela_cobertura[coluna], errors="coerce")
+                    .round()
+                    .astype("Int64")
+                )
+
+        st.dataframe(
+            tabela_cobertura,
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 # ════════════════════════════════════════════════════════════════
